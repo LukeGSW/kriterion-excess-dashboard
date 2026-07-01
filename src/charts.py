@@ -2,8 +2,10 @@
 charts.py — Grafici Plotly standardizzati (tema scuro Kriterion Quant).
 
 Due grafici principali:
-    1. build_excess_histogram  -> distribuzione dei rendimenti di periodo con
-       mediana, bande ±Nσ, zone d'eccesso ombreggiate e posizione attuale.
+    1. build_returns_cascade   -> tre grafici a barre impilati (giornaliero /
+       settimanale / mensile): ogni barra è il rendimento di un periodo, con
+       linee orizzontali di mediana, ±Nσ e valore attuale. È la vista d'insieme
+       per capire a colpo d'occhio dove siamo rispetto allo storico.
     2. build_forward_histogram -> distribuzione dei rendimenti forward dopo un
        eccesso, per smascherare reversione vs momentum.
 
@@ -14,6 +16,10 @@ from __future__ import annotations
 
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Colore delle barre "normali" (dentro le bande): blu-grigio tenue
+BAR_NORMAL = "rgba(120,140,190,0.55)"
 
 COLORS = {
     "primary":    "#2196F3",
@@ -48,80 +54,119 @@ def _base_layout(title: str, x_title: str = "", y_title: str = "",
     )
 
 
-def build_excess_histogram(res: dict) -> go.Figure:
-    """Istogramma dei rendimenti di periodo con bande σ e posizione attuale.
+def build_returns_cascade(results: dict, order: list[str]) -> go.Figure:
+    """Cascata di 3 grafici a barre dei rendimenti nel tempo (D / W / M).
 
-    Le bande (mediana ± kσ) usano sempre le statistiche full-sample: sono il
-    riferimento visivo della distribuzione, indipendentemente dalla modalità di
-    rilevazione scelta. La banda alla soglia N selezionata è evidenziata; le
-    altre sono tratteggiate leggere per contesto.
+    Ogni barra è il rendimento di un periodo. Le tre righe condividono l'asse
+    temporale, così eccessi allineati nel tempo sui diversi orizzonti si leggono
+    a colpo d'occhio.
+
+    Le bande σ sono quelle EFFETTIVAMENTE usate per la rilevazione (mode-aware):
+        - mediana (bianca) e ±Nσ (arancio) disegnate come linee nel tempo:
+          piatte in modalità Statica, ondulate in modalità Adattiva (si
+          ricalcolano ad ogni barra sulla volatilità recente);
+        - altri livelli σ di contesto (grigio tratteggiato);
+        - valore attuale (linea gialla orizzontale) → dove siamo ORA rispetto a
+          tutto lo storico.
+    Le barre oltre la soglia per-barra sono evidenziate: rosso = eccesso sopra,
+    verde = eccesso sotto. Una barra colorata sta dunque esattamente oltre la
+    linea ±Nσ disegnata nello stesso istante.
 
     Args:
-        res: output di calculations.analyze_horizon().
+        results: dict {nome_orizzonte: output di analyze_horizon()}.
+        order:   ordine degli orizzonti dall'alto verso il basso.
     """
-    ret = res["ret_full"] * 100.0           # in percentuale
-    center = res["hist_center"] * 100.0
-    sigma = res["hist_sigma"] * 100.0
-    n_std = res["n_std"]
-    levels = res["sigma_levels"]
+    fig = make_subplots(rows=len(order), cols=1, shared_xaxes=True,
+                        vertical_spacing=0.06)
 
-    upper_n = center + n_std * sigma
-    lower_n = center - n_std * sigma
+    for i, name in enumerate(order, start=1):
+        res = results[name]
+        first_row = (i == 1)  # legenda mostrata solo sulla prima riga
 
-    fig = go.Figure()
+        # Etichetta orizzonte dentro il pannello (in alto a sinistra)
+        cur = res.get("current") if res.get("ok") else None
+        lbl = name
+        if cur is not None:
+            lbl += f" · ora {cur['ret']*100:+.2f}% (z={cur['z']:+.2f})"
+        fig.add_annotation(text=f"<b>{lbl}</b>", row=i, col=1,
+                           xref="x domain", yref="y domain", x=0.01, y=0.97,
+                           showarrow=False, xanchor="left",
+                           font=dict(size=12, color=COLORS["text"]))
 
-    # Zone d'eccesso ombreggiate (rosso = ipercomprato sopra, verde = ipervenduto sotto)
-    x_max = float(ret.max())
-    x_min = float(ret.min())
-    fig.add_vrect(x0=upper_n, x1=x_max, fillcolor=COLORS["negative"],
-                  opacity=0.10, line_width=0, layer="below")
-    fig.add_vrect(x0=x_min, x1=lower_n, fillcolor=COLORS["positive"],
-                  opacity=0.10, line_width=0, layer="below")
-
-    # Istogramma dei rendimenti
-    fig.add_trace(go.Histogram(
-        x=ret, nbinsx=80, name="Rendimenti",
-        marker_color=COLORS["primary"], opacity=0.75,
-        hovertemplate="Rendimento: %{x:.2f}%<br>Frequenza: %{y}<extra></extra>",
-    ))
-
-    # Bande σ di contesto (tratteggiate leggere), escludendo la soglia N
-    for k in levels:
-        if abs(k - n_std) < 1e-9:
+        if not res.get("ok"):
             continue
-        for sign in (+1, -1):
-            xpos = center + sign * k * sigma
-            lab = f"{'+' if sign > 0 else '-'}{k}σ"
-            fig.add_vline(x=xpos, line=dict(color=COLORS["neutral"], width=1,
-                          dash="dot"), opacity=0.45,
-                          annotation_text=lab, annotation_position="top",
-                          annotation_font=dict(size=9, color=COLORS["neutral"]))
 
-    # Mediana
-    fig.add_vline(x=center, line=dict(color=COLORS["text"], width=1.5),
-                  annotation_text="Mediana", annotation_position="top",
-                  annotation_font=dict(size=10, color=COLORS["text"]))
+        ret = res["ret_full"] * 100.0
+        idx = ret.index
+        n_std = res["n_std"]
+        bc = res["band_center"] * 100.0          # centro per-barra (Series)
+        bs = res["band_sigma"] * 100.0           # sigma per-barra (Series)
+        upper = bc + n_std * bs
+        lower = bc - n_std * bs
 
-    # Soglie N selezionate (evidenziate)
-    for xpos, lab in [(upper_n, f"+{n_std:g}σ"), (lower_n, f"-{n_std:g}σ")]:
-        fig.add_vline(x=xpos, line=dict(color=COLORS["secondary"], width=2),
-                      annotation_text=lab, annotation_position="top",
-                      annotation_font=dict(size=11, color=COLORS["secondary"]))
+        # --- Barre colorate per eccesso (soglia per-barra) ---
+        vals = ret.values
+        up_v = np.where(np.isnan(upper.values), np.inf, upper.values)
+        dn_v = np.where(np.isnan(lower.values), -np.inf, lower.values)
+        colors = np.where(vals >= up_v, COLORS["negative"],
+                          np.where(vals <= dn_v, COLORS["positive"], BAR_NORMAL))
+        fig.add_trace(go.Bar(
+            x=idx, y=vals, marker_color=colors, marker_line_width=0,
+            showlegend=False,
+            hovertemplate="%{x|%d/%m/%Y}<br>Rendimento: %{y:.2f}%<extra></extra>",
+        ), row=i, col=1)
 
-    # Posizione attuale (massima evidenza)
-    cur = res.get("current")
-    if cur is not None:
-        xpos = cur["ret"] * 100.0
-        zlab = f"Ora: {xpos:+.2f}%  (z={cur['z']:+.2f})"
-        fig.add_vline(x=xpos, line=dict(color=COLORS["accent"], width=2.5),
-                      annotation_text=zlab, annotation_position="bottom",
-                      annotation_font=dict(size=11, color=COLORS["accent"]))
+        # --- Bande σ di contesto (livelli diversi dalla soglia N) ---
+        for k in res["sigma_levels"]:
+            if abs(k - n_std) < 1e-9:
+                continue
+            for band in (bc + k * bs, bc - k * bs):
+                fig.add_trace(go.Scatter(
+                    x=idx, y=band.values, mode="lines", showlegend=False,
+                    line=dict(color=COLORS["neutral"], width=0.8, dash="dot"),
+                    opacity=0.4, hoverinfo="skip",
+                ), row=i, col=1)
 
-    fig.update_layout(**_base_layout(
-        f"Distribuzione rendimenti {res['name'].lower()} — bande σ full-sample",
-        x_title="Rendimento di periodo (%)", y_title="Frequenza", height=380,
-    ))
-    fig.update_layout(showlegend=False)
+        # --- Mediana / centro (linea nel tempo) ---
+        fig.add_trace(go.Scatter(
+            x=idx, y=bc.values, mode="lines", name="mediana",
+            legendgroup="med", showlegend=first_row, hoverinfo="skip",
+            line=dict(color=COLORS["text"], width=1.3),
+        ), row=i, col=1)
+
+        # --- ±Nσ (soglia selezionata, evidenziata) ---
+        fig.add_trace(go.Scatter(
+            x=idx, y=upper.values, mode="lines", name=f"±{n_std:g}σ",
+            legendgroup="nsig", showlegend=first_row, hoverinfo="skip",
+            line=dict(color=COLORS["secondary"], width=1.4),
+        ), row=i, col=1)
+        fig.add_trace(go.Scatter(
+            x=idx, y=lower.values, mode="lines", name=f"-{n_std:g}σ",
+            legendgroup="nsig", showlegend=False, hoverinfo="skip",
+            line=dict(color=COLORS["secondary"], width=1.4),
+        ), row=i, col=1)
+
+        # --- Valore attuale (linea orizzontale gialla) ---
+        if cur is not None:
+            fig.add_hline(y=cur["ret"] * 100.0, row=i, col=1,
+                          line=dict(color=COLORS["accent"], width=2),
+                          annotation_text="ORA", annotation_position="top right",
+                          annotation_font=dict(size=10, color=COLORS["accent"]))
+
+        fig.update_yaxes(title_text="Rend. %", row=i, col=1,
+                         gridcolor="#333355", color=COLORS["text"], zeroline=False)
+
+    fig.update_xaxes(gridcolor="#333355", color=COLORS["text"])
+    fig.update_layout(
+        title=dict(text="Rendimenti storici per periodo — bande σ (ricalcolate) e posizione attuale",
+                   font=dict(size=16, color=COLORS["text"])),
+        paper_bgcolor=COLORS["background"], plot_bgcolor=COLORS["surface"],
+        font=dict(color=COLORS["text"], family="Inter, Arial, sans-serif"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.005, x=0,
+                    bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=60, r=40, t=80, b=40),
+        height=300 * len(order), bargap=0.0,
+    )
     return fig
 
 
