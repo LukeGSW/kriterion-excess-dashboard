@@ -20,7 +20,7 @@ import streamlit as st
 
 from src.data_fetcher import fetch_eod, get_price_series
 from src.calculations import HORIZONS, analyze_horizon, reliability
-from src.charts import build_excess_histogram, build_forward_histogram, COLORS
+from src.charts import build_returns_cascade, build_forward_histogram, COLORS
 
 # ===================================================
 # CONFIGURAZIONE PAGINA
@@ -179,7 +179,25 @@ st.divider()
 
 
 # ===================================================
-# 2) QUADRO SINTETICO — matrice color-coded
+# 2) RENDIMENTI STORICI — cascata a barre (vista d'insieme)
+# ===================================================
+st.subheader("📊 Rendimenti storici — cascata giornaliero · settimanale · mensile")
+st.caption(
+    "Ogni **barra** è il rendimento di un periodo lungo tutto lo storico. "
+    "Le linee di **mediana** (bianca) e **±Nσ** (arancio) sono quelle usate per la "
+    "rilevazione: **piatte** in modalità Statica, **ondulate** in Adattiva (si "
+    "ricalcolano ad ogni barra sulla volatilità recente). La linea **gialla** è il "
+    "**valore attuale**. Barre oltre soglia evidenziate (🔴 eccesso sopra · 🟢 sotto). "
+    "I tre grafici condividono l'asse temporale per confrontare gli orizzonti a colpo d'occhio."
+)
+st.plotly_chart(build_returns_cascade(results, list(HORIZONS)),
+                use_container_width=True)
+
+st.divider()
+
+
+# ===================================================
+# 3) QUADRO SINTETICO — matrice color-coded
 # ===================================================
 st.subheader("🧭 Quadro sintetico")
 st.caption("Il numero che conta è l'**edge** (winrate condizionato − baseline). "
@@ -244,9 +262,9 @@ st.divider()
 
 
 # ===================================================
-# 3) DETTAGLIO PER ORIZZONTE (tab)
+# 4) DETTAGLIO PER ORIZZONTE (tab) — lo studio forward
 # ===================================================
-st.subheader("🔬 Dettaglio per orizzonte")
+st.subheader("🔬 Cosa è successo dopo l'eccesso")
 
 
 def render_direction(res: dict, direction: str):
@@ -288,11 +306,11 @@ for tab, name in zip(tabs, HORIZONS):
             continue
 
         st.caption(
-            f"Bande dell'istogramma: mediana ± kσ **full-sample** (riferimento visivo). "
-            f"Rilevazione eventi in modalità **{res['mode']}**. "
-            f"Cooldown = {HORIZONS[name]['fwd']} periodi (finestre forward indipendenti)."
+            f"Rilevazione eventi in modalità **{res['mode']}** · "
+            f"soglia **{res['n_std']:g}σ** · "
+            f"forward **{res['fwd_label']}** · "
+            f"cooldown = {HORIZONS[name]['fwd']} periodi (finestre indipendenti)."
         )
-        st.plotly_chart(build_excess_histogram(res), use_container_width=True)
 
         d1, d2 = st.columns(2)
         with d1:
