@@ -14,12 +14,14 @@ Le metriche fragili non vengono mai nascoste: un semaforo segnala quando il
 numero di eventi è troppo basso per fidarsi (🟢 ≥30 · 🟡 10-29 · 🔴 <10).
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from src.data_fetcher import fetch_eod, get_price_series
-from src.calculations import HORIZONS, analyze_horizon, reliability
+from src.calculations import HORIZONS, analyze_horizon, reliability, build_export
 from src.charts import build_returns_cascade, build_forward_histogram, COLORS
 
 # ===================================================
@@ -141,6 +143,29 @@ c1.metric("Ultimo prezzo", f"{price.iloc[-1]:,.2f}")
 c2.metric("Storico", f"{years:.1f} anni")
 c3.metric("Osservazioni", f"{len(price):,}")
 c4.metric("Dal", price.index[0].strftime("%d/%m/%Y"))
+
+# --- Export JSON per report LLM ---
+export_payload = json.dumps(
+    build_export(ticker, n_std, mode, price, results),
+    ensure_ascii=False, indent=2, allow_nan=False, default=str,
+)
+ec1, ec2 = st.columns([1, 3])
+with ec1:
+    st.download_button(
+        "⬇️ Scarica dati analisi (JSON)",
+        data=export_payload,
+        file_name=f"analisi_eccessi_{ticker.replace('.', '_')}_"
+                  f"{pd.Timestamp.today():%Y%m%d}.json",
+        mime="application/json",
+        use_container_width=True,
+        help="Tutte le metriche dello studio in JSON, pronte da dare a un LLM "
+             "per generare un report.",
+    )
+with ec2:
+    st.caption("Include un **prompt pronto** (`prompt_report`) + metriche, winrate, "
+               "edge, baseline, stato attuale, sensibilità e statistiche "
+               "distribuzionali per tutti gli orizzonti, con legenda dei campi. "
+               "Consegnalo a un LLM così com'è per ottenere il report.")
 
 st.divider()
 
