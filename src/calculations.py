@@ -285,6 +285,12 @@ def analyze_horizon(daily_price: pd.Series, name: str, n_std: float,
     price_vals = df_full["price"].values
     k = cfg["fwd"]
 
+    # Bande per-barra effettivamente usate per la rilevazione (mode-aware),
+    # allineate all'asse dei rendimenti. In modalità Statica sono costanti
+    # (linea piatta); in Adattiva variano nel tempo (linea che sale/scende).
+    band_center = df_full["center"].reindex(ret_full.index)
+    band_sigma = df_full["sigma"].reindex(ret_full.index)
+
     # --- Eventi de-clusterizzati e finestre forward ---
     up_pos = apply_cooldown(df_valid.loc[df_valid["up"], "pos"].values, k)
     dn_pos = apply_cooldown(df_valid.loc[df_valid["down"], "pos"].values, k)
@@ -321,6 +327,8 @@ def analyze_horizon(daily_price: pd.Series, name: str, n_std: float,
         ret_full=ret_full,
         hist_center=hist_center,
         hist_sigma=hist_sigma,
+        band_center=band_center,
+        band_sigma=band_sigma,
         n_periods=int(len(price)),
         first_date=price.index[0],
         last_date=price.index[-1],
