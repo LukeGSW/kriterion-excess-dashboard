@@ -340,3 +340,194 @@ def analyze_horizon(daily_price: pd.Series, name: str, n_std: float,
         baseline=base,
         sensitivity=sensitivity_counts(df_valid, k),
     )
+
+
+# === Export JSON per LLM =================================================
+
+def _num(x, nd: int = 4):
+    """Converte in float arrotondato; NaN/inf/None -> None (JSON-safe)."""
+    if x is None:
+        return None
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return None
+    return round(xf, nd) if np.isfinite(xf) else None
+
+
+def build_export(ticker: str, n_std: float, mode: str,
+                 price: pd.Series, results: dict) -> dict:
+    """Costruisce un dizionario JSON-serializzabile con tutti i risultati.
+
+    Pensato per essere dato in pasto a un LLM che redige un report: include
+    metriche, winrate, edge, baseline, stato attuale, sensibilità e statistiche
+    distribuzionali per ogni orizzonte — ma non le serie storiche grezze, per
+    restare compatto e interpretabile. I valori con suffisso `_pct` sono
+    percentuali; `edge_punti_pct` è winrate − baseline in punti percentuali.
+    """
+    from datetime import datetime, timezone
+
+    def dist_summary(ret_full: pd.Series, sigma_levels) -> dict:
+        r = ret_full.dropna().values
+        med = float(np.median(r))
+        sd = float(np.std(r, ddof=1)) if len(r) > 1 else float("nan")
+        bands = {}
+        for kk in sigma_levels:
+            bands[f"+{kk:g}sigma_pct"] = _num((med + kk * sd) * 100, 3)
+            bands[f"-{kk:g}sigma_pct"] = _num((med - kk * sd) * 100, 3)
+        return {
+            "osservazioni": int(len(r)),
+            "media_pct": _num(np.mean(r) * 100, 4),
+            "mediana_pct": _num(med * 100, 4),
+            "dev_std_pct": _num(sd * 100, 4),
+            "min_pct": _num(np.min(r) * 100, 3),
+            "max_pct": _num(np.max(r) * 100, 3),
+            "skew": _num(stats.skew(r), 3),
+            "excess_kurtosis": _num(stats.kurtosis(r), 3),
+            "bande_sigma_fullsample": bands,
+        }
+
+    def dir_block(m: dict, direction: str) -> dict:
+        _, rel = reliability(m["n"])
+        win_def = ("rendimento forward < 0 (reversione al ribasso)"
+                   if direction == "up"
+                   else "rendimento forward > 0 (reversione al rialzo)")
+        return {
+            "definizione_win": win_def,
+            "n_eventi": int(m["n"]),
+            "affidabilita": rel,
+            "winrate_pct": _num(m["winrate"] * 100, 2),
+            "baseline_pct": _num(m["baseline"] * 100, 2),
+            "edge_punti_pct": _num(m["edge"] * 100, 2),
+            "forward_medio_pct": _num(m["mean"] * 100, 3),
+            "forward_mediano_pct": _num(m["median"] * 100, 3),
+            "forward_std_pct": _num(m["std"] * 100, 3),
+            "forward_p25_pct": _num(m["p25"] * 100, 3),
+            "forward_p75_pct": _num(m["p75"] * 100, 3),
+            "forward_migliore_pct": _num(m["best"] * 100, 3),
+            "forward_peggiore_pct": _num(m["worst"] * 100, 3),
+            "t_stat": _num(m["tstat"], 3),
+            "p_value": _num(m["pval"], 4),
+        }
+
+    prompt_report = (
+        f"Sei un analista quantitativo esperto. Questo stesso JSON contiene i "
+        f"risultati di uno 'studio sugli eccessi' sull'asset {ticker}: misura "
+        f"cosa è storicamente accaduto ai rendimenti dopo che un periodo ha "
+        f"chiuso oltre N deviazioni standard (un eccesso), su tre orizzonti "
+        f"(giornaliero → 5 giorni dopo, settimanale → 4 settimane, mensile → "
+        f"3 mesi).\n\n"
+        f"Prima di scrivere, leggi il campo 'legenda_campi' per interpretare "
+        f"correttamente ogni metrica e le unità (i campi con suffisso _pct sono "
+        f"percentuali; edge_punti_pct = winrate − baseline in punti percentuali).\n\n"
+        f"REGOLE DI INTERPRETAZIONE:\n"
+        f"- Il numero che conta è l'EDGE (winrate meno baseline), non il winrate "
+        f"assoluto: un winrate del 55% con baseline 54% non è un segnale.\n"
+        f"- Rispetta l'affidabilità: usa i risultati 'Affidabile' (≥30 eventi), "
+        f"tratta con cautela gli 'Indicativo' (10-29) e segnala come aneddotici "
+        f"gli 'Aneddotico' (<10 eventi), senza trarne conclusioni forti anche se "
+        f"il winrate è alto.\n"
+        f"- Un p-value piccolo su pochi eventi non è una prova solida.\n"
+        f"- Non inventare dati assenti nel JSON e non usare conoscenza esterna "
+        f"sull'asset.\n\n"
+        f"STRUTTURA DEL REPORT:\n"
+        f"1. Sintesi iniziale: l'asset è in eccesso ORA e su quali orizzonti? "
+        f"(usa stato_attuale, zscore, in_eccesso_sopra/sotto).\n"
+        f"2. Per ogni orizzonte, commenta separatamente eccesso_sopra ed "
+        f"eccesso_sotto: edge vs baseline, numero eventi e affidabilità, "
+        f"rendimento forward medio/mediano, e se prevale REVERSIONE (l'eccesso "
+        f"si riassorbe) o MOMENTUM (continua nella stessa direzione).\n"
+        f"3. Confronta i tre orizzonti: dove l'edge è più solido e affidabile?\n"
+        f"4. Conclusione operativa: i pattern più robusti e come si collegano "
+        f"allo stato attuale, evidenziando i limiti (campioni piccoli, studio "
+        f"descrittivo, nessun costo di transazione o volatility clustering "
+        f"modellato).\n\n"
+        f"Tono: professionale, sintetico, basato esclusivamente sui dati del JSON."
+    )
+
+    years = (price.index[-1] - price.index[0]).days / 365.25
+    export = {
+        "prompt_report": prompt_report,
+        "meta": {
+            "schema": "kriterion-excess-analysis/1.0",
+            "generato_il": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ticker": ticker,
+            "parametri": {
+                "soglia_n_sigma": n_std,
+                "modalita_soglia": mode,
+                "definizione_win": "direzionale (reversione)",
+                "cooldown": "pari all'orizzonte forward (finestre indipendenti)",
+                "baseline": "probabilita' incondizionata su tutti i periodi",
+                "prezzo_usato": "adjusted close",
+            },
+            "storico": {
+                "dal": price.index[0].strftime("%Y-%m-%d"),
+                "al": price.index[-1].strftime("%Y-%m-%d"),
+                "anni": _num(years, 1),
+                "osservazioni_giornaliere": int(len(price)),
+                "ultimo_prezzo": _num(float(price.iloc[-1]), 4),
+            },
+        },
+        "legenda_campi": {
+            "unita": "I campi con suffisso _pct sono percentuali. edge_punti_pct "
+                     "e' winrate_pct - baseline_pct in punti percentuali.",
+            "winrate_pct": "Percentuale di eventi in cui si e' verificata la "
+                           "reversione attesa (secondo definizione_win).",
+            "baseline_pct": "Probabilita' della stessa direzione entrando in un "
+                            "periodo qualsiasi: e' il metro di paragone.",
+            "edge_punti_pct": "Vantaggio reale = winrate - baseline. Se ~0 o "
+                              "negativo, nessun edge sfruttabile.",
+            "affidabilita": "Affidabile >=30 eventi, Indicativo 10-29, Aneddotico "
+                            "<10. Sotto i 10 eventi i numeri sono poco attendibili.",
+            "p_value": "Test t sulla media dei rendimenti forward != 0. Piccolo = "
+                       "piu' significativo (ma attenzione ai campioni piccoli).",
+            "zscore": "Rendimento attuale in deviazioni standard rispetto alla "
+                      "soglia (coerente con la modalita' scelta).",
+        },
+        "orizzonti": {},
+    }
+
+    for name, res in results.items():
+        if not res.get("ok"):
+            export["orizzonti"][name] = {"ok": False,
+                                         "motivo": res.get("reason", "n/d")}
+            continue
+
+        cur = res.get("current")
+        current = None
+        if cur:
+            current = {
+                "data": cur["date"].strftime("%Y-%m-%d"),
+                "rendimento_pct": _num(cur["ret"] * 100, 3),
+                "zscore": _num(cur["z"], 3),
+                "in_eccesso_sopra": bool(cur["up"]),
+                "in_eccesso_sotto": bool(cur["down"]),
+            }
+
+        b = res["baseline"]
+        sens = [
+            {"n_sigma": _num(row["N σ"], 2),
+             "eventi_sopra": int(row["Eventi sopra"]),
+             "eventi_sotto": int(row["Eventi sotto"])}
+            for _, row in res["sensitivity"].iterrows()
+        ]
+
+        export["orizzonti"][name] = {
+            "orizzonte_forward": res["fwd_label"],
+            "n_periodi": int(res["n_periods"]),
+            "distribuzione_rendimenti": dist_summary(res["ret_full"],
+                                                     res["sigma_levels"]),
+            "stato_attuale": current,
+            "baseline_forward": {
+                "prob_positivo_pct": _num(b["p_up"] * 100, 2),
+                "prob_negativo_pct": _num(b["p_down"] * 100, 2),
+                "forward_medio_pct": _num(b["mean"] * 100, 3),
+                "forward_mediano_pct": _num(b["median"] * 100, 3),
+            },
+            "eccesso_sopra": dir_block(res["up"], "up"),
+            "eccesso_sotto": dir_block(res["down"], "down"),
+            "sensibilita_soglia": sens,
+        }
+
+    return export
+
